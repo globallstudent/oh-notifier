@@ -72,9 +72,9 @@ def _detect_category(event: ErrorEvent) -> ErrorCategory:
 
 
 def _detect_severity(event: ErrorEvent) -> ErrorSeverity:
-    # Info is only set explicitly via send_info()
-    if event.severity == ErrorSeverity.INFO:
-        return ErrorSeverity.INFO
+    # Preserve explicitly set severity (from send_info/send_warning)
+    if event.severity in (ErrorSeverity.INFO, ErrorSeverity.WARNING):
+        return event.severity
 
     # Critical: database, unhandled 500s, startup failures
     if event.category == ErrorCategory.DATABASE:

@@ -16,7 +16,7 @@ _SEVERITY_ICONS = {
     ErrorSeverity.INFO: "\U0001f535",      # blue circle
 }
 
-_SEP = "\n\u2500" * 20
+_SEP = "\n" + "\u2500" * 20
 
 # Fields already handled in specific sections — skip from "Other" section
 _HANDLED_FIELDS = frozenset({
