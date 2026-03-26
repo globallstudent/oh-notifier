@@ -26,6 +26,8 @@ _HANDLED_FIELDS = frozenset({
     "hamkor_status", "hamkor_response", "hamkor_error",
     "logger", "order_id", "card_number_last4", "endpoint",
     "method", "status_code", "error_code", "elapsed_ms", "attempt",
+    "os", "python", "arch", "ip", "pod", "namespace", "node",
+    "container_id", "git_commit",
 })
 
 
@@ -62,6 +64,21 @@ def format_error_html(event: ErrorEvent, count: int = 1) -> str:
         env_str = f"[{_esc(env.upper())}]" if env else ""
         host_str = _esc(hostname) if hostname else ""
         parts.append(f"{env_str} {host_str}".strip())
+
+    # -- Device info (compact) --
+    device_parts: list[str] = []
+    if e.get("pod"):
+        device_parts.append(f"pod:{_esc(e['pod'])}")
+    if e.get("node"):
+        device_parts.append(f"node:{_esc(e['node'])}")
+    if e.get("ip") and not e.get("pod"):
+        device_parts.append(f"ip:{_esc(e['ip'])}")
+    if e.get("os"):
+        device_parts.append(_esc(e["os"]))
+    if e.get("container_id"):
+        device_parts.append(f"ctr:{_esc(e['container_id'])}")
+    if device_parts:
+        parts.append(f"<i>{' | '.join(device_parts)}</i>")
 
     # -- Error Section --
     parts.append(_SEP)

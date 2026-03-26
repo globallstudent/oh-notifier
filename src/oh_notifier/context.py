@@ -45,8 +45,45 @@ def init_env_info(
     app_env: str | None = None,
     git_commit: str | None = None,
 ) -> None:
-    """Call once at startup to store hostname/env/commit."""
+    """Call once at startup to store hostname/env/commit and device metadata."""
+    import socket
+
     _env_info["hostname"] = platform.node()
     _env_info["env"] = app_env or os.environ.get("APP_ENV", "DEVELOPMENT")
+
+    # Device metadata
+    _env_info["os"] = f"{platform.system()} {platform.release()}"
+    _env_info["python"] = platform.python_version()
+    _env_info["arch"] = platform.machine()
+
+    # Network identity
+    try:
+        _env_info["ip"] = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        pass
+
+    # Container/K8s detection
+    pod_name = os.environ.get("HOSTNAME", "")
+    if pod_name:
+        _env_info["pod"] = pod_name
+    k8s_namespace = os.environ.get("POD_NAMESPACE", "")
+    if k8s_namespace:
+        _env_info["namespace"] = k8s_namespace
+    node_name = os.environ.get("NODE_NAME", "")
+    if node_name:
+        _env_info["node"] = node_name
+
+    # Container ID from cgroup (Docker/K8s)
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            for line in f:
+                if "docker" in line or "containerd" in line or "kubepods" in line:
+                    container_id = line.strip().split("/")[-1][:12]
+                    if container_id:
+                        _env_info["container_id"] = container_id
+                    break
+    except Exception:
+        pass
+
     if git_commit or os.environ.get("GIT_COMMIT"):
         _env_info["git_commit"] = (git_commit or os.environ.get("GIT_COMMIT", ""))[:12]
