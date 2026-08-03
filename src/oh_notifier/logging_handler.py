@@ -1,5 +1,3 @@
-"""Python logging handler that sends ERROR+ records to Telegram."""
-
 from __future__ import annotations
 
 import logging

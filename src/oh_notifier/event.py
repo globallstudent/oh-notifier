@@ -1,5 +1,3 @@
-"""Error event dataclass and classification enums."""
-
 from __future__ import annotations
 
 import hashlib
@@ -10,7 +8,6 @@ from enum import Enum
 
 
 class _StrEnum(str, Enum):
-    """``str`` + ``Enum`` — ``enum.StrEnum`` is 3.11+ and we support 3.10."""
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return str(self.value)
@@ -105,18 +102,6 @@ class ErrorEvent:
 
     @property
     def fingerprint(self) -> str:
-        """Dedup key.
-
-        Built from the error type, the last application frame, the endpoint,
-        and — crucially — a normalized message whenever there is no traceback.
-
-        Without that last part every traceback-less record of a given type
-        hashed identically: a logger error fingerprinted as
-        ``md5("LogError:")`` no matter what it said, so unrelated failures
-        merged and the channel showed whichever arrived first with a count
-        beside it. The endpoint is included for the same reason — the same
-        line failing on two routes is two different problems.
-        """
         last_frame = ""
         for match in _app_frame_re.finditer(self.traceback_text):
             last_frame = f"{match.group(1)}:{match.group(2)}:{match.group(3)}"

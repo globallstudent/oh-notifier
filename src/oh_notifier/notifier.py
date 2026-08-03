@@ -17,12 +17,6 @@ logger = logging.getLogger("oh_notifier")
 
 
 class TelegramNotifier:
-    """Singleton error notifier with buffered, deduped Telegram delivery.
-
-    Nothing here touches the network on the caller's thread. ``capture()``
-    updates a dict under a lock and pokes the delivery worker; every send
-    happens on the worker's own thread and event loop.
-    """
 
     _instance: TelegramNotifier | None = None
 
@@ -172,13 +166,6 @@ class TelegramNotifier:
 
 
 def _pack(messages: list[str], limit: int) -> list[str]:
-    """Concatenate messages that fit together.
-
-    Each send costs a serialized ``rate_limit_interval`` sleep, so a burst of
-    twenty distinct errors used to take twenty seconds to leave the process.
-    Packing them into as few messages as Telegram's size cap allows turns
-    that into one or two.
-    """
     if len(messages) <= 1:
         return messages
 

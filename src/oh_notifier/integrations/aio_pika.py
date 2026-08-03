@@ -1,5 +1,3 @@
-"""aio-pika RabbitMQ consumer error capture."""
-
 from __future__ import annotations
 
 import functools
@@ -20,18 +18,6 @@ def safe_consumer_handler(
     queue_name: str = "",
     exchange_name: str = "",
 ) -> Callable:
-    """Decorator that wraps an aio_pika message handler with error capture.
-
-    Usage:
-        @safe_consumer_handler(queue_name="orders", exchange_name="orders")
-        async def handle_order_created(data: dict, message: Any) -> None:
-            ...
-
-    Or without arguments:
-        @safe_consumer_handler
-        async def handle_order_created(data: dict, message: Any) -> None:
-            ...
-    """
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:

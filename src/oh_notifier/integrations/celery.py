@@ -1,5 +1,3 @@
-"""Celery task failure signal integration."""
-
 from __future__ import annotations
 
 import logging
@@ -14,7 +12,6 @@ logger = logging.getLogger("oh_notifier.celery")
 
 
 def setup_celery_alerts(celery_app: Any = None) -> None:
-    """Connect to Celery task_failure and task_retry signals."""
     try:
         from celery.signals import task_failure, task_retry
     except ImportError:

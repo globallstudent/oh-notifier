@@ -1,5 +1,3 @@
-"""Process-wide capture hooks and helpers."""
-
 from __future__ import annotations
 
 import asyncio
@@ -99,12 +97,6 @@ def setup_loop_exception_handler(
 
 
 def setup_excepthooks() -> None:
-    """Capture exceptions that kill a thread or reach the interpreter.
-
-    Neither path goes through ``logging``, so without these hooks a crash in
-    a plain ``threading.Thread`` — or one that unwinds ``main`` — produced a
-    traceback on stderr and no alert at all.
-    """
     previous_hook = sys.excepthook
 
     def _sys_hook(
@@ -138,21 +130,12 @@ def setup_excepthooks() -> None:
 
 
 def _flush_now() -> None:
-    """Ask the delivery worker to send immediately. Does not wait."""
     notifier = TelegramNotifier.get_instance()
     if notifier:
         notifier.request_flush()
 
 
 def sync_flush() -> None:
-    """Request a flush from synchronous code (Celery tasks, scripts).
-
-    Only signals the delivery worker; the caller is never blocked. The old
-    implementation built a fresh event loop and drove the existing
-    ``httpx.AsyncClient`` on it — a client is bound to the loop that created
-    it, so this hung or raised, and it ran inline on every Celery task
-    failure, stalling the task for up to the HTTP timeout.
-    """
     try:
         _flush_now()
     except Exception:

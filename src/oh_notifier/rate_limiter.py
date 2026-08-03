@@ -11,12 +11,6 @@ from oh_notifier.event import ErrorEvent
 
 
 class ErrorBuffer:
-    """Thread-safe error buffer with dedup by fingerprint.
-
-    ``add`` is the only oh-notifier code that runs on the caller's thread, so
-    it stays a dict update under a short lock — no I/O, no awaiting, nothing
-    that can stall a request or a task.
-    """
 
     def __init__(
         self,
@@ -33,7 +27,6 @@ class ErrorBuffer:
         self._dropped = 0
 
     def add(self, event: ErrorEvent) -> bool:
-        """Add event with dedup. Returns True when a flush should happen now."""
         # Auto-merge request context
         try:
             ctx = get_request_context()

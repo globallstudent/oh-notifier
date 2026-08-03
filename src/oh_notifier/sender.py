@@ -1,17 +1,3 @@
-"""Telegram Bot API message dispatch.
-
-Delivery previously swallowed every failure, so a message Telegram refused
-was simply gone — no retry, no record, no way to tell the difference between
-"nothing broke" and "the alert never arrived". Two of those refusals were
-self-inflicted: the formatter truncated already-escaped text (splitting
-``&amp;`` mid-entity) and its final safety cut appended a bare ``</pre>``,
-both of which make Telegram answer 400 and drop the message.
-
-So: bounded retries with backoff for transport and 5xx, ``retry_after`` for
-429, and a plain-text retry when HTML is rejected — a plain alert beats a
-lost one. Failures are counted and surfaced instead of vanishing.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +18,6 @@ _HARD_LIMIT = 4096
 
 @dataclass
 class SendStats:
-    """Delivery accounting, reported on the next message when non-zero."""
-
     sent: int = 0
     failed: int = 0
     retried: int = 0
@@ -49,8 +33,6 @@ class SendStats:
 
 @dataclass
 class _Backoff:
-    """Exponential backoff with a ceiling."""
-
     base: float = 0.5
     factor: float = 2.0
     ceiling: float = 8.0
@@ -60,13 +42,10 @@ class _Backoff:
 
 
 def to_plain_text(html_text: str) -> str:
-    """Strip tags and unescape — the fallback when Telegram rejects our HTML."""
     return html.unescape(_TAG_RE.sub("", html_text))
 
 
 class TelegramSender:
-    """Sends messages to Telegram with rate limiting and bounded retries."""
-
     def __init__(
         self,
         bot_token: str,

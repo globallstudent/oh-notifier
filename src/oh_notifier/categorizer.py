@@ -1,5 +1,3 @@
-"""Auto-classify ErrorEvent severity and category."""
-
 from __future__ import annotations
 
 from oh_notifier.event import ErrorCategory, ErrorEvent, ErrorSeverity, ErrorSource

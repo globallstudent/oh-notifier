@@ -1,5 +1,3 @@
-"""ContextVar-based request context for per-request metadata."""
-
 from __future__ import annotations
 
 import contextvars
@@ -7,12 +5,6 @@ import os
 import platform
 from typing import Any
 
-#: ``None`` rather than ``{}``. A mutable default is shared by every context
-#: that has not set its own, and the old code did ``ctx.update(...)`` on
-#: whatever ``get()`` returned — so a task that inherited a parent's dict
-#: mutated the parent's copy. Concretely: one request's ``user_id`` could
-#: surface on another request's alert. Each write now installs a fresh dict,
-#: which is what makes contextvars copy-on-write in practice.
 _request_ctx: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "_oh_request_ctx", default=None
 )
@@ -21,7 +13,6 @@ _env_info: dict[str, str] = {}
 
 
 def set_request_context(**kwargs: Any) -> None:
-    """Add context to the current request (user_id, order_id, etc.)."""
     try:
         updates = {k: str(v) for k, v in kwargs.items() if v is not None}
         if not updates:
@@ -35,7 +26,6 @@ def set_request_context(**kwargs: Any) -> None:
 
 
 def get_request_context() -> dict[str, str]:
-    """Return merged env info + per-request context."""
     try:
         ctx = dict(_env_info)
         current = _request_ctx.get()
@@ -47,12 +37,10 @@ def get_request_context() -> dict[str, str]:
 
 
 def reset_request_context() -> None:
-    """Reset per-request context. Called at start of each request."""
     _request_ctx.set(None)
 
 
 def get_env_info() -> dict[str, str]:
-    """The process-wide metadata captured at startup."""
     return dict(_env_info)
 
 
@@ -61,14 +49,7 @@ def init_env_info(
     git_commit: str | None = None,
     environment_source: str | None = None,
 ) -> None:
-    """Call once at startup to store host/env/commit and device metadata.
 
-    Everything here is a cheap local read. The previous version also did a
-    ``socket.gethostbyname(socket.gethostname())``, a blocking DNS lookup on
-    the startup path that can stall for seconds when resolution is slow — a
-    real risk in a cluster, and of little value there since the pod name and
-    node name below identify the workload better than a pod IP does.
-    """
     _env_info["hostname"] = platform.node()
     if app_env:
         _env_info["env"] = app_env
@@ -91,7 +72,6 @@ def init_env_info(
         if value:
             _env_info[key] = value
 
-    # Container ID from cgroup (Docker/K8s)
     try:
         with open("/proc/self/cgroup", "r") as f:
             for line in f:

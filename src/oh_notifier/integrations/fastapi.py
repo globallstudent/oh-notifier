@@ -1,5 +1,3 @@
-"""FastAPI/Starlette ASGI error middleware."""
-
 from __future__ import annotations
 
 import base64
@@ -20,13 +18,6 @@ logger = logging.getLogger("oh_notifier.fastapi")
 
 
 class ErrorMiddleware:
-    """Raw ASGI middleware that reports failures to Telegram.
-
-    Catches unhandled exceptions *and* error responses that never raised —
-    an exception handler that turns a fault into a JSON 500 is still a
-    fault, and the previous version reported none of those because it only
-    saw exceptions propagating out of the app.
-    """
 
     def __init__(
         self,
@@ -197,13 +188,6 @@ class ErrorMiddleware:
 
 
 def _decode_jwt_claims(headers: dict[str, str]) -> dict[str, str]:
-    """Read user_id/phone/role from a Bearer token.
-
-    The signature is deliberately NOT verified: this is labelling for an
-    alert, not authorisation, and the middleware has no access to the signing
-    key. Returns the claims rather than writing context itself so the caller
-    can apply a single contextvar write.
-    """
     claims: dict[str, str] = {}
     try:
         auth_header = headers.get("authorization", "")
