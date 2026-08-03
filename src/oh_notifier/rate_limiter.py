@@ -11,17 +11,29 @@ from oh_notifier.event import ErrorEvent
 
 
 class ErrorBuffer:
-    """Thread-safe error buffer with dedup by fingerprint."""
+    """Thread-safe error buffer with dedup by fingerprint.
 
-    def __init__(self, dedup_window: float = 300.0, max_size: int = 50) -> None:
+    ``add`` is the only oh-notifier code that runs on the caller's thread, so
+    it stays a dict update under a short lock — no I/O, no awaiting, nothing
+    that can stall a request or a task.
+    """
+
+    def __init__(
+        self,
+        dedup_window: float = 300.0,
+        max_size: int = 50,
+        max_pending: int = 500,
+    ) -> None:
         self._dedup_window = dedup_window
         self._max_size = max_size
+        self._max_pending = max_pending
         # fingerprint -> (event, count, first_seen_monotonic)
         self._buffer: dict[str, tuple[ErrorEvent, int, float]] = {}
         self._lock = threading.Lock()
+        self._dropped = 0
 
     def add(self, event: ErrorEvent) -> bool:
-        """Add event to buffer with dedup. Returns True if buffer overflow."""
+        """Add event with dedup. Returns True when a flush should happen now."""
         # Auto-merge request context
         try:
             ctx = get_request_context()
@@ -40,32 +52,41 @@ class ErrorBuffer:
 
         fp = event.fingerprint
         now = time.monotonic()
-        overflow = False
 
         with self._lock:
-            if fp in self._buffer:
-                existing_event, count, first_seen = self._buffer[fp]
+            existing = self._buffer.get(fp)
+            if existing is not None:
+                existing_event, count, first_seen = existing
                 if (now - first_seen) > self._dedup_window:
                     self._buffer[fp] = (event, 1, now)
                 else:
                     self._buffer[fp] = (existing_event, count + 1, first_seen)
             else:
+                if len(self._buffer) >= self._max_pending:
+                    # Hard ceiling. Count the loss so the next message can
+                    # say so — a silently truncated storm reads like calm.
+                    self._dropped += 1
+                    return True
                 self._buffer[fp] = (event, 1, now)
 
-            if len(self._buffer) > self._max_size:
-                overflow = True
+            return len(self._buffer) >= self._max_size
 
-        return overflow
-
-    def drain(self) -> list[tuple[ErrorEvent, int]]:
-        """Atomically grab all buffer contents. Returns list of (event, count)."""
+    def drain(self) -> tuple[list[tuple[ErrorEvent, int]], int]:
+        """Atomically take the buffer. Returns ``(items, dropped_since_last)``."""
         with self._lock:
-            if not self._buffer:
-                return []
+            if not self._buffer and not self._dropped:
+                return [], 0
             items = [(ev, count) for ev, count, _ in self._buffer.values()]
+            dropped = self._dropped
             self._buffer.clear()
-        return items
+            self._dropped = 0
+        return items, dropped
 
     def is_empty(self) -> bool:
         with self._lock:
             return not self._buffer
+
+    @property
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._buffer)

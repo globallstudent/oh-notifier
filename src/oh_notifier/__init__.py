@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from oh_notifier.config import OhNotifierSettings, _set_settings
-from oh_notifier.context import init_env_info, set_request_context, get_request_context
+from oh_notifier.context import (
+    get_request_context,
+    init_env_info,
+    set_request_context,
+)
+from oh_notifier.env import (
+    UNKNOWN_ENVIRONMENT,
+    load_dotenv_files,
+    resolve_environment,
+)
 from oh_notifier.event import (
     ErrorCategory,
     ErrorEvent,
@@ -16,7 +26,9 @@ from oh_notifier.event import (
 )
 from oh_notifier.notifier import TelegramNotifier
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+logger = logging.getLogger("oh_notifier")
 
 __all__ = [
     "configure",
@@ -27,6 +39,7 @@ __all__ = [
     "send_info",
     "set_request_context",
     "get_request_context",
+    "stats",
     "ErrorEvent",
     "ErrorSeverity",
     "ErrorCategory",
@@ -38,7 +51,7 @@ def configure(
     bot_token: str = "",
     chat_id: str = "",
     service_name: str = "unknown",
-    environment: str = "development",
+    environment: str | None = None,
     enabled: bool = True,
     timezone: str = "UTC",
     dedup_window: float = 300.0,
@@ -48,13 +61,42 @@ def configure(
     min_log_level: int = logging.ERROR,
     sensitive_keys: frozenset[str] | None = None,
     app_frame_pattern: str | None = None,
+    *,
+    load_dotenv: bool = True,
+    dotenv_dir: str | os.PathLike[str] | None = None,
+    environments_enabled: frozenset[str] | None = None,
+    git_commit: str | None = None,
 ) -> TelegramNotifier:
-    """Configure oh-notifier. Call once at startup before anything else."""
+    """Configure oh-notifier. Call once at startup before anything else.
+
+    Resolution order for every value: this call's arguments, then
+    ``OH_NOTIFIER_*`` environment variables (optionally suffixed with the
+    environment name for per-environment overrides), then defaults.
+
+    The environment itself is resolved from ``OH_NOTIFIER_ENV``, ``APP_ENV``,
+    ``ENVIRONMENT`` or ``ENV``. If none are set the result is ``unknown`` and
+    a warning is logged — the previous silent ``"development"`` default is
+    why every production alert this project ever sent was labelled
+    ``[DEVELOPMENT]``.
+    """
+    resolved_env, source = resolve_environment(environment)
+
+    applied_files: list[str] = []
+    if load_dotenv:
+        try:
+            applied_files = load_dotenv_files(resolved_env, dotenv_dir)
+        except Exception:
+            applied_files = []
+        if applied_files:
+            # A .env may itself define APP_ENV; re-resolve so it counts.
+            resolved_env, source = resolve_environment(environment)
+
     settings = OhNotifierSettings(
         bot_token=bot_token,
         chat_id=chat_id,
         service_name=service_name,
-        environment=environment,
+        environment=resolved_env,
+        environment_source=source,
         enabled=enabled,
         timezone=timezone,
         dedup_window=dedup_window,
@@ -66,19 +108,35 @@ def configure(
 
     if sensitive_keys is not None:
         settings.sensitive_keys = sensitive_keys
+    if environments_enabled is not None:
+        settings.environments_enabled = environments_enabled
+
+    settings.apply_env_overrides()
 
     if app_frame_pattern:
         settings.app_frame_pattern = app_frame_pattern
-        set_app_frame_pattern(app_frame_pattern)
+    set_app_frame_pattern(settings.app_frame_pattern)
 
     _set_settings(settings)
-    init_env_info(app_env=environment)
+    init_env_info(
+        app_env=settings.environment,
+        git_commit=git_commit,
+        environment_source=source,
+    )
+
+    if settings.environment == UNKNOWN_ENVIRONMENT:
+        logger.warning(
+            "oh-notifier could not determine the environment — set APP_ENV "
+            "(or OH_NOTIFIER_ENV). Alerts will be labelled 'ENV UNKNOWN'."
+        )
+    if applied_files:
+        logger.info("oh-notifier loaded env files: %s", ", ".join(applied_files))
 
     return TelegramNotifier.initialize(settings)
 
 
 async def start() -> None:
-    """Start the notifier background flush loop."""
+    """Start the notifier background delivery worker."""
     notifier = TelegramNotifier.get_instance()
     if notifier:
         await notifier.start()
@@ -89,6 +147,12 @@ async def stop() -> None:
     notifier = TelegramNotifier.get_instance()
     if notifier:
         await notifier.stop()
+
+
+def stats() -> dict[str, int | str]:
+    """Delivery counters — safe to expose from a health endpoint."""
+    notifier = TelegramNotifier.get_instance()
+    return notifier.stats if notifier else {}
 
 
 def send_alert(
@@ -148,6 +212,7 @@ def _send(
         error_message=error_message,
         source=source,
         severity=severity,
+        environment=notifier.settings.environment,
         extras=merged_extras,
     )
     notifier.capture(event)

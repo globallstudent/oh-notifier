@@ -13,7 +13,7 @@ def test_add_and_drain():
     buf = ErrorBuffer(dedup_window=300, max_size=50)
     event = ErrorEvent(service_name="s", error_type="E", error_message="m")
     buf.add(event)
-    items = buf.drain()
+    items, _ = buf.drain()
     assert len(items) == 1
     assert items[0][1] == 1  # count = 1
 
@@ -25,7 +25,7 @@ def test_dedup_same_fingerprint():
     e2 = ErrorEvent(service_name="s", error_type="E", error_message="m2", traceback_text=tb)
     buf.add(e1)
     buf.add(e2)
-    items = buf.drain()
+    items, _ = buf.drain()
     assert len(items) == 1
     assert items[0][1] == 2  # count = 2
 
@@ -42,7 +42,7 @@ def test_different_fingerprints():
     )
     buf.add(e1)
     buf.add(e2)
-    items = buf.drain()
+    items, _ = buf.drain()
     assert len(items) == 2
 
 
@@ -51,10 +51,10 @@ def test_drain_clears_buffer():
     buf.add(ErrorEvent(service_name="s", error_type="E", error_message="m"))
     buf.drain()
     assert buf.is_empty()
-    assert buf.drain() == []
+    assert buf.drain() == ([], 0)
 
 
-def test_overflow_returns_true():
+def test_overflow_requests_flush():
     buf = ErrorBuffer(dedup_window=300, max_size=3)
     for i in range(5):
         overflow = buf.add(ErrorEvent(

@@ -35,10 +35,44 @@ def test_fingerprint_different_location():
     assert e1.fingerprint != e2.fingerprint
 
 
-def test_fingerprint_no_traceback():
-    e1 = ErrorEvent(service_name="s", error_type="Error", error_message="m1")
-    e2 = ErrorEvent(service_name="s", error_type="Error", error_message="m2")
-    assert e1.fingerprint == e2.fingerprint  # same type, no frame = same fp
+def test_fingerprint_no_traceback_separates_distinct_messages():
+    """Traceback-less records must NOT all collapse into one alert.
+
+    This asserted the opposite until the message was added to the key. With
+    no frame to hash, every record of a given type produced the same
+    fingerprint — so unrelated logger errors merged and the channel showed
+    whichever arrived first with a count beside it, hiding the rest.
+    """
+    e1 = ErrorEvent(service_name="s", error_type="Error", error_message="disk full")
+    e2 = ErrorEvent(service_name="s", error_type="Error", error_message="bad gateway")
+    assert e1.fingerprint != e2.fingerprint
+
+
+def test_fingerprint_no_traceback_groups_same_message():
+    """The same failure with a different id is still one problem."""
+    e1 = ErrorEvent(
+        service_name="s", error_type="Error",
+        error_message="order 8f2c1a3e-0000-4000-8000-000000000001 not found",
+    )
+    e2 = ErrorEvent(
+        service_name="s", error_type="Error",
+        error_message="order 41ab99cd-0000-4000-8000-000000000002 not found",
+    )
+    assert e1.fingerprint == e2.fingerprint
+
+
+def test_fingerprint_separates_endpoints():
+    """The same line failing on two routes is two different problems."""
+    tb = 'File "/app/a.py", line 1, in f\nError'
+    e1 = ErrorEvent(
+        service_name="s", error_type="Error", error_message="m",
+        traceback_text=tb, endpoint="/orders",
+    )
+    e2 = ErrorEvent(
+        service_name="s", error_type="Error", error_message="m",
+        traceback_text=tb, endpoint="/nurses",
+    )
+    assert e1.fingerprint != e2.fingerprint
 
 
 def test_enums_are_strings():

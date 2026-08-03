@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 
 from oh_notifier.config import OhNotifierSettings
+from oh_notifier.dispatcher import DeliveryWorker
 from oh_notifier.event import ErrorEvent
-from oh_notifier.formatter import format_error_html
+from oh_notifier.formatter import format_error_html, format_notice
 from oh_notifier.rate_limiter import ErrorBuffer
 from oh_notifier.sender import TelegramSender
 
@@ -15,7 +17,12 @@ logger = logging.getLogger("oh_notifier")
 
 
 class TelegramNotifier:
-    """Singleton error notifier with buffered, deduped Telegram delivery."""
+    """Singleton error notifier with buffered, deduped Telegram delivery.
+
+    Nothing here touches the network on the caller's thread. ``capture()``
+    updates a dict under a lock and pokes the delivery worker; every send
+    happens on the worker's own thread and event loop.
+    """
 
     _instance: TelegramNotifier | None = None
 
@@ -24,14 +31,23 @@ class TelegramNotifier:
         self._buffer = ErrorBuffer(
             dedup_window=settings.dedup_window,
             max_size=settings.max_buffer_size,
+            max_pending=settings.max_pending_events,
         )
         self._sender = TelegramSender(
             bot_token=settings.bot_token,
             chat_id=settings.chat_id,
             rate_limit=settings.rate_limit_interval,
+            timeout=settings.send_timeout,
+            max_attempts=settings.max_send_attempts,
         )
-        self._flush_task: asyncio.Task[None] | None = None
-        self._running = False
+        self._worker = DeliveryWorker(
+            flush=self._flush_buffer,
+            setup=self._sender.start,
+            teardown=self._sender.stop,
+            interval=settings.flush_interval,
+        )
+        self._flush_lock = asyncio.Lock()
+        self._atexit_registered = False
 
     @classmethod
     def initialize(cls, settings: OhNotifierSettings) -> TelegramNotifier:
@@ -48,67 +64,135 @@ class TelegramNotifier:
     def service_name(self) -> str:
         return self._settings.service_name
 
+    @property
+    def settings(self) -> OhNotifierSettings:
+        return self._settings
+
+    @property
+    def stats(self) -> dict[str, int | str]:
+        """Delivery counters — useful from a health endpoint."""
+        s = self._sender.stats
+        return {
+            "sent": s.sent,
+            "failed": s.failed,
+            "retried": s.retried,
+            "html_rejected": s.html_rejected,
+            "pending": self._buffer.pending,
+            "last_error": s.last_error,
+        }
+
+    # -- lifecycle ---------------------------------------------------------
+
     async def start(self) -> None:
-        """Start the background flush loop."""
-        if not self._settings.enabled:
-            logger.info("oh-notifier is disabled")
+        """Start the background delivery worker."""
+        if not self._settings.alerting_allowed():
+            logger.info(
+                "oh-notifier is not alerting (enabled=%s environment=%s)",
+                self._settings.enabled,
+                self._settings.environment,
+            )
             return
-        await self._sender.start()
-        self._running = True
-        self._flush_task = asyncio.create_task(
-            self._flush_loop(), name="oh-notifier-flush"
+        if not self._sender.configured:
+            logger.warning(
+                "oh-notifier has no bot_token/chat_id — errors are buffered but "
+                "cannot be delivered"
+            )
+        self._worker.start()
+        if not self._atexit_registered:
+            atexit.register(self._atexit_flush)
+            self._atexit_registered = True
+        logger.info(
+            "oh-notifier started (environment=%s via %s)",
+            self._settings.environment,
+            self._settings.environment_source,
         )
-        logger.info("oh-notifier started")
 
     async def stop(self) -> None:
-        """Stop flush loop, do a final flush, close sender."""
-        self._running = False
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                pass
-        try:
-            await self._flush_buffer()
-        except Exception:
-            pass
-        await self._sender.stop()
+        """Stop the worker after a final drain."""
+        await self._worker.astop()
         logger.info("oh-notifier stopped")
 
-    def capture(self, event: ErrorEvent) -> None:
-        """Thread-safe: enqueue an error event into the buffer with dedup."""
-        if not self._settings.enabled:
-            return
-        overflow = self._buffer.add(event)
-        if overflow:
-            self._schedule_immediate_flush()
-
-    def _schedule_immediate_flush(self) -> None:
+    def _atexit_flush(self) -> None:
+        """Last-chance drain if stop() was never called (crash, SIGKILL-less exit)."""
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(self._flush_buffer())
-                )
-        except RuntimeError:
+            self._worker.stop(timeout=5.0)
+        except Exception:
             pass
 
-    async def _flush_loop(self) -> None:
-        while self._running:
-            try:
-                await asyncio.sleep(self._settings.flush_interval)
-                await self._flush_buffer()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
+    # -- capture -----------------------------------------------------------
+
+    def request_flush(self) -> None:
+        """Ask the worker to deliver now. Thread-safe, never blocks."""
+        self._worker.wake()
+
+    def capture(self, event: ErrorEvent) -> None:
+        """Thread-safe, non-blocking: enqueue an error event with dedup."""
+        if not self._settings.alerting_allowed():
+            return
+        if not event.environment:
+            event.environment = self._settings.environment
+        try:
+            if self._buffer.add(event):
+                self._worker.wake()
+        except Exception:
+            # Capturing an error must never raise into application code.
+            pass
+
+    # -- delivery ----------------------------------------------------------
 
     async def _flush_buffer(self) -> None:
-        items = self._buffer.drain()
-        for event, count in items:
-            try:
-                message = format_error_html(event, count)
-                await self._sender.send(message)
-            except Exception:
-                pass
+        """Drain the buffer and deliver. Serialized against itself."""
+        async with self._flush_lock:
+            items, dropped = self._buffer.drain()
+            if not items and not dropped:
+                return
+
+            messages = [format_error_html(event, count) for event, count in items]
+
+            failed, last_error = self._sender.stats.snapshot_and_reset_failures()
+            notices: list[str] = []
+            if dropped:
+                notices.append(
+                    f"{dropped} further distinct error(s) dropped — buffer ceiling "
+                    f"({self._settings.max_pending_events}) reached"
+                )
+            if failed:
+                notices.append(f"{failed} earlier alert(s) failed to send: {last_error}")
+            if notices:
+                messages.append(format_notice(self._settings, notices))
+
+            if self._settings.batch_messages:
+                messages = _pack(messages, self._settings.max_message_len)
+
+            for message in messages:
+                try:
+                    await self._sender.send(message)
+                except Exception:
+                    pass
+
+
+def _pack(messages: list[str], limit: int) -> list[str]:
+    """Concatenate messages that fit together.
+
+    Each send costs a serialized ``rate_limit_interval`` sleep, so a burst of
+    twenty distinct errors used to take twenty seconds to leave the process.
+    Packing them into as few messages as Telegram's size cap allows turns
+    that into one or two.
+    """
+    if len(messages) <= 1:
+        return messages
+
+    joiner = "\n\n"
+    packed: list[str] = []
+    current = ""
+    for message in messages:
+        if not current:
+            current = message
+        elif len(current) + len(joiner) + len(message) <= limit:
+            current = f"{current}{joiner}{message}"
+        else:
+            packed.append(current)
+            current = message
+    if current:
+        packed.append(current)
+    return packed

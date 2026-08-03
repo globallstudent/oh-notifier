@@ -54,6 +54,9 @@ def setup_celery_alerts(celery_app: Any = None) -> None:
                 },
             )
             notifier.capture(event)
+            # Signal only — the delivery worker owns the network call. This
+            # used to run the send inline on a throwaway event loop, which
+            # stalled the worker process for the duration of the HTTP call.
             sync_flush()
         except Exception:
             pass

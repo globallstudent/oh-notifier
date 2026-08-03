@@ -1,66 +1,189 @@
-"""Telegram Bot API message dispatch with rate limiting."""
+"""Telegram Bot API message dispatch.
+
+Delivery previously swallowed every failure, so a message Telegram refused
+was simply gone — no retry, no record, no way to tell the difference between
+"nothing broke" and "the alert never arrived". Two of those refusals were
+self-inflicted: the formatter truncated already-escaped text (splitting
+``&amp;`` mid-entity) and its final safety cut appended a bare ``</pre>``,
+both of which make Telegram answer 400 and drop the message.
+
+So: bounded retries with backoff for transport and 5xx, ``retry_after`` for
+429, and a plain-text retry when HTML is rejected — a plain alert beats a
+lost one. Failures are counted and surfaced instead of vanishing.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import logging
+import html
+import re
+import sys
+import time
+from dataclasses import dataclass
 
 import httpx
 
-logger = logging.getLogger("oh_notifier.sender")
+_TAG_RE = re.compile(r"<[^>]*>")
+
+#: Telegram refuses anything past this; keep a little headroom for the
+#: "(plain text fallback)" note we may prepend.
+_HARD_LIMIT = 4096
+
+
+@dataclass
+class SendStats:
+    """Delivery accounting, reported on the next message when non-zero."""
+
+    sent: int = 0
+    failed: int = 0
+    retried: int = 0
+    html_rejected: int = 0
+    last_error: str = ""
+
+    def snapshot_and_reset_failures(self) -> tuple[int, str]:
+        failed, err = self.failed, self.last_error
+        self.failed = 0
+        self.last_error = ""
+        return failed, err
+
+
+@dataclass
+class _Backoff:
+    """Exponential backoff with a ceiling."""
+
+    base: float = 0.5
+    factor: float = 2.0
+    ceiling: float = 8.0
+
+    def delay(self, attempt: int) -> float:
+        return min(self.base * (self.factor ** attempt), self.ceiling)
+
+
+def to_plain_text(html_text: str) -> str:
+    """Strip tags and unescape — the fallback when Telegram rejects our HTML."""
+    return html.unescape(_TAG_RE.sub("", html_text))
 
 
 class TelegramSender:
-    """Sends messages to Telegram with rate limiting and 429 retry."""
+    """Sends messages to Telegram with rate limiting and bounded retries."""
 
-    def __init__(self, bot_token: str, chat_id: str, rate_limit: float = 1.0) -> None:
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        rate_limit: float = 1.0,
+        timeout: float = 10.0,
+        max_attempts: int = 3,
+    ) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
         self._rate_limit = rate_limit
+        self._timeout = timeout
+        self._max_attempts = max(1, max_attempts)
         self._client: httpx.AsyncClient | None = None
         self._last_send_time = 0.0
+        self._backoff = _Backoff()
+        self.stats = SendStats()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._bot_token and self._chat_id)
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=10.0)
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
 
     async def stop(self) -> None:
-        if self._client:
+        client, self._client = self._client, None
+        if client is not None:
             try:
-                await self._client.aclose()
+                await client.aclose()
             except Exception:
                 pass
-            self._client = None
 
-    async def send(self, html_text: str) -> None:
-        """Send HTML message to Telegram with rate limiting."""
-        if not self._client:
-            return
+    @property
+    def _url(self) -> str:
+        return f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
 
-        # Rate limiting
-        now = asyncio.get_event_loop().time()
-        elapsed = now - self._last_send_time
+    async def _respect_rate_limit(self) -> None:
+        # monotonic(), not loop.time(): the value must stay comparable even
+        # if this sender is ever driven from more than one loop.
+        elapsed = time.monotonic() - self._last_send_time
         if elapsed < self._rate_limit:
             await asyncio.sleep(self._rate_limit - elapsed)
 
-        url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+    async def send(self, html_text: str) -> bool:
+        """Deliver one message. Returns True if Telegram accepted it."""
+        if self._client is None or not self.configured:
+            return False
+
         payload = {
             "chat_id": self._chat_id,
-            "text": html_text,
+            "text": html_text[:_HARD_LIMIT],
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
 
-        try:
-            resp = await self._client.post(url, json=payload)
-            self._last_send_time = asyncio.get_event_loop().time()
+        for attempt in range(self._max_attempts):
+            await self._respect_rate_limit()
+            try:
+                resp = await self._client.post(self._url, json=payload)
+            except Exception as exc:  # transport: DNS, connect, timeout, TLS
+                self._note_failure(f"{type(exc).__name__}: {exc}")
+                if attempt + 1 < self._max_attempts:
+                    self.stats.retried += 1
+                    await asyncio.sleep(self._backoff.delay(attempt))
+                    continue
+                return False
+            finally:
+                self._last_send_time = time.monotonic()
+
+            if resp.status_code == 200:
+                self.stats.sent += 1
+                return True
 
             if resp.status_code == 429:
-                try:
-                    retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
-                except Exception:
-                    retry_after = 5
-                await asyncio.sleep(retry_after)
-                await self._client.post(url, json=payload)
-                self._last_send_time = asyncio.get_event_loop().time()
+                await asyncio.sleep(self._retry_after(resp))
+                self.stats.retried += 1
+                continue
+
+            if resp.status_code == 400 and payload["parse_mode"] == "HTML":
+                # Almost always our own malformed markup. Re-send as plain
+                # text rather than lose the alert entirely.
+                self.stats.html_rejected += 1
+                payload = {
+                    "chat_id": self._chat_id,
+                    "text": to_plain_text(html_text)[:_HARD_LIMIT],
+                    "disable_web_page_preview": True,
+                }
+                self.stats.retried += 1
+                continue
+
+            if resp.status_code >= 500:
+                self._note_failure(f"telegram {resp.status_code}")
+                if attempt + 1 < self._max_attempts:
+                    self.stats.retried += 1
+                    await asyncio.sleep(self._backoff.delay(attempt))
+                    continue
+                return False
+
+            # 401/403/404 — bad token or chat id. Retrying cannot help.
+            self._note_failure(f"telegram {resp.status_code}: {resp.text[:200]}")
+            return False
+
+        self._note_failure("exhausted send attempts")
+        return False
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> float:
+        try:
+            return float(resp.json().get("parameters", {}).get("retry_after", 5))
         except Exception:
-            pass
+            return 5.0
+
+    def _note_failure(self, reason: str) -> None:
+        self.stats.failed += 1
+        self.stats.last_error = reason
+        # stderr, never `logging` — the logging handler feeds this module and
+        # routing a delivery failure back through it would recurse.
+        print(f"[oh-notifier] telegram delivery failed: {reason}", file=sys.stderr)

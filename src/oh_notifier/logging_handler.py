@@ -16,7 +16,14 @@ _LOGGER_EXTRA_KEYS = frozenset({
     "hamkor_method", "hamkor_request_id", "hamkor_status",
     "hamkor_response", "hamkor_error", "order_id",
     "card_number_last4", "body", "content_type", "content_length",
+    "task_name", "task_id", "queue_name", "routing_key", "job_id",
 })
+
+_LEVEL_TO_SOURCE = {
+    logging.CRITICAL: ErrorSource.LOGGER,
+    logging.ERROR: ErrorSource.LOGGER,
+    logging.WARNING: ErrorSource.LOGGER,
+}
 
 
 class OhLoggingHandler(logging.Handler):
@@ -24,7 +31,10 @@ class OhLoggingHandler(logging.Handler):
 
     def __init__(self, level: int | None = None) -> None:
         settings = _get_settings_or_none()
-        effective_level = level or (settings.min_log_level if settings else logging.ERROR)
+        effective_level = (
+            level if level is not None
+            else (settings.min_log_level if settings else logging.ERROR)
+        )
         super().__init__(level=effective_level)
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -41,17 +51,22 @@ class OhLoggingHandler(logging.Handler):
             if not notifier:
                 return
 
+            exc = record.exc_info[1] if record.exc_info else None
             tb_text = ""
-            if record.exc_info and record.exc_info[1]:
+            if record.exc_info and exc is not None:
                 tb_text = "".join(traceback.format_exception(*record.exc_info))
 
-            error_type = (
-                type(record.exc_info[1]).__name__
-                if record.exc_info and record.exc_info[1]
-                else "LogError"
-            )
+            if exc is not None:
+                error_type = type(exc).__name__
+            else:
+                # "LogError" for everything made every traceback-less record
+                # look alike. The level plus the logger's own name is far more
+                # useful at a glance, and feeds a better fingerprint.
+                error_type = f"{record.levelname.title()}:{record.name.split('.')[-1]}"
 
             extras: dict[str, str] = {"logger": record.name}
+            if record.funcName:
+                extras["func"] = f"{record.module}.{record.funcName}:{record.lineno}"
 
             for key in _LOGGER_EXTRA_KEYS:
                 val = getattr(record, key, None)
@@ -59,12 +74,22 @@ class OhLoggingHandler(logging.Handler):
                     target_key = "response_body" if key == "body" else key
                     extras[target_key] = str(val)
 
+            status_code = 0
+            raw_status = getattr(record, "status_code", None)
+            if raw_status is not None:
+                try:
+                    status_code = int(raw_status)
+                except (TypeError, ValueError):
+                    status_code = 0
+
             event = ErrorEvent(
                 service_name=settings.service_name,
                 error_type=error_type,
                 error_message=record.getMessage(),
                 traceback_text=tb_text,
-                source=ErrorSource.LOGGER,
+                status_code=status_code,
+                source=_LEVEL_TO_SOURCE.get(record.levelno, ErrorSource.LOGGER),
+                environment=settings.environment,
                 extras=extras,
             )
             notifier.capture(event)

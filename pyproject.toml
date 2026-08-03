@@ -1,6 +1,6 @@
 [project]
 name = "oh-notifier"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight error monitoring for Python services — Telegram alerts + auto-categorization"
 readme = "README.md"
 requires-python = ">=3.10"
