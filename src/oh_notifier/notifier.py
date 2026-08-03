@@ -9,7 +9,7 @@ import logging
 from oh_notifier.config import OhNotifierSettings
 from oh_notifier.dispatcher import DeliveryWorker
 from oh_notifier.event import ErrorEvent
-from oh_notifier.formatter import format_error_html, format_notice
+from oh_notifier.formatter import format_error_messages, format_notice
 from oh_notifier.rate_limiter import ErrorBuffer
 from oh_notifier.sender import TelegramSender
 
@@ -141,7 +141,12 @@ class TelegramNotifier:
             if not items and not dropped:
                 return
 
-            messages = [format_error_html(event, count) for event, count in items]
+            # An event can render as several messages: the traceback overflow
+            # continues into follow-ups rather than being cut, so the line
+            # that explains the failure is never the part that gets dropped.
+            messages: list[str] = []
+            for event, count in items:
+                messages.extend(format_error_messages(event, count))
 
             failed, last_error = self._sender.stats.snapshot_and_reset_failures()
             notices: list[str] = []

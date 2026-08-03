@@ -9,6 +9,9 @@ from zoneinfo import ZoneInfo
 from oh_notifier.config import _get_settings_or_none
 from oh_notifier.env import UNKNOWN_ENVIRONMENT
 from oh_notifier.event import ErrorEvent, ErrorSeverity
+from oh_notifier.traceback_util import chunk as chunk_text
+from oh_notifier.traceback_util import condense as condense_traceback
+from oh_notifier.traceback_util import exception_summary
 
 if TYPE_CHECKING:
     from oh_notifier.config import OhNotifierSettings
@@ -125,6 +128,17 @@ def format_error_html(event: ErrorEvent, count: int = 1) -> str:
     parts.append(_SEP)
     parts.append(f"<b>Error:</b> <code>{_esc(event.error_type)}</code>")
     parts.append(f"<b>Message:</b> {_esc(event.error_message, 500)}")
+
+    # The exception line from the BOTTOM of the traceback, lifted to the top.
+    # For wrapped failures the useful sentence lives at the very end — a
+    # MissingGreenlet alert once arrived with "greenlet_spawn has not been
+    # called; can't call await_only() here" cut off the bottom, leaving the
+    # reader three screens of framework plumbing and no cause. Shown only
+    # when it differs from the message already printed above.
+    cause = exception_summary(event.traceback_text)
+    if cause and cause[:80] not in event.error_message:
+        parts.append(f"<b>Cause:</b> {_esc(cause, 400)}")
+
     if event.category:
         parts.append(f"<b>Category:</b> {_esc(event.category)}")
 
@@ -246,27 +260,75 @@ def format_error_html(event: ErrorEvent, count: int = 1) -> str:
         footer_parts.append(f"[{_esc(source)}]")
     parts.append("  ".join(footer_parts))
 
+    header = "\n".join(parts)
+    if len(header) > max_msg_len:
+        # The header alone overflows (huge bodies/extras) — cut it safely.
+        return _cut_to_valid(header, max_msg_len)
+    if not event.traceback_text:
+        return header
+
     # -- Traceback --
-    if event.traceback_text:
-        header_len = sum(len(p) + 1 for p in parts)
-        # Room for the separator, the <pre> wrapper and a safety margin.
-        available = max_msg_len - header_len - 60
-        if available > 100:
-            # Truncate the RAW traceback, then escape — escaping first and
-            # cutting after can split an entity and get the message rejected.
-            tb = html.escape(_smart_truncate(event.traceback_text, available))
-            parts.append(_SEP)
-            parts.append(f"<pre>{tb}</pre>")
+    # Escaping inflates the text (&lt; etc.), so condense against a budget
+    # measured AFTER escaping, then escape the result.
+    overhead = len(_SEP) + len("<pre></pre>") + 2
+    available = max_msg_len - len(header) - overhead
+    if available < 120:
+        return header
 
-    result = "\n".join(parts)
+    tb = condense_traceback(event.traceback_text, available)
+    escaped = html.escape(tb)
+    while len(escaped) > available and len(tb) > 40:
+        tb = condense_traceback(tb, int(len(tb) * 0.8))
+        escaped = html.escape(tb)
 
-    if len(result) > max_msg_len:
-        # Cut on a line boundary so we never end mid-tag or mid-entity;
-        # the old code appended a bare "</pre>" which produced markup
-        # Telegram rejects outright.
-        result = _cut_to_valid(result, max_msg_len)
+    return f"{header}{_SEP}\n<pre>{escaped}</pre>"
 
-    return result
+
+def format_error_messages(
+    event: ErrorEvent, count: int = 1, max_parts: int = 3
+) -> list[str]:
+    """Render an event as one or more Telegram messages.
+
+    The first carries the full context; any remainder of the traceback
+    follows in continuation messages instead of being thrown away. Capped at
+    ``max_parts`` so a single pathological traceback cannot flood the channel
+    — and when the cap bites, the message says how much was dropped rather
+    than trailing off.
+    """
+    settings = _get_settings_or_none()
+    max_msg_len = settings.max_message_len if settings else 4096
+
+    first = format_error_html(event, count)
+    if not event.traceback_text:
+        return [first]
+
+    # What of the traceback actually made it into the first message?
+    shown = ""
+    if "<pre>" in first:
+        shown = html.unescape(first.rsplit("<pre>", 1)[1].split("</pre>")[0])
+
+    full = condense_traceback(event.traceback_text, max_msg_len * max_parts)
+    if not shown or shown not in full:
+        return [first]
+
+    remainder = full[full.index(shown) + len(shown) :].lstrip("\n")
+    if not remainder.strip():
+        return [first]
+
+    messages = [first]
+    body_budget = max_msg_len - 80  # room for the "part N" heading
+    pieces = chunk_text(remainder, body_budget)
+
+    for index, piece in enumerate(pieces[: max_parts - 1], start=2):
+        messages.append(
+            f"<b>↳ traceback (part {index})</b>\n<pre>{html.escape(piece)}</pre>"
+        )
+
+    dropped = len(pieces) - (max_parts - 1)
+    if dropped > 0:
+        messages[-1] += f"\n<i>({dropped} further section(s) omitted)</i>"
+
+    return messages
 
 
 def _cut_to_valid(text: str, limit: int) -> str:
